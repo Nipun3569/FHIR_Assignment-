@@ -5,7 +5,7 @@ from pyspark.sql.window import Window
 from delta.tables import DeltaTable
 
 
-resource_type = ["Patient","Encounter","Observation","Condition"]            # Patient | Encounter | Observation | Condition
+resource_type = "Patient"           # Patient | Encounter | Observation | Condition
 silver_table  = f"silver_{resource_type.lower()}"
 bronze_table  = f"bronze_{resource_type.lower()}"
 
@@ -169,10 +169,9 @@ def run_silver_load(resource_type: str) -> dict:
 
 
 
-#result = run_silver_load(resource_type)
+result = run_silver_load(resource_type)
 
 
-for rt in ["Patient", "Encounter", "Observation", "Condition"]:
-     run_silver_load(rt)
+
 
 notebookutils.notebook.exit(str(result))
