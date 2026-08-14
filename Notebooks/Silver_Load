@@ -1,0 +1,178 @@
+
+
+from pyspark.sql.functions import col, row_number, lit, current_timestamp, regexp_extract
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+
+
+resource_type = ["Patient","Encounter","Observation","Condition"]            # Patient | Encounter | Observation | Condition
+silver_table  = f"silver_{resource_type.lower()}"
+bronze_table  = f"bronze_{resource_type.lower()}"
+
+FAR_FUTURE_DATE = "9999-12-31"       # EffectiveEndDate sentinel for current rows
+
+
+
+def flatten_resource(df, resource_type: str):
+    # Reference strings look like "Patient/abc123" — this pulls just the id.
+    ref_id = lambda ref_col: regexp_extract(ref_col, r"([^/]+)$", 1)
+
+    if resource_type == "Patient":
+        return df.select(
+            col("resource_id"),
+            col("version_id"),
+            col("fhir_last_updated"),
+            col("resource_type"),
+            col("resource.name")[0]["family"].alias("family_name"),
+            col("resource.name")[0]["given"][0].alias("given_name"),
+            col("resource.gender").alias("gender"),
+            col("resource.birthDate").alias("birth_date"),
+            col("api_url_or_params"),
+            col("extraction_timestamp"),
+            col("resource").alias("resource_raw"),   # keep full struct for anything not flattened yet
+        )
+
+    elif resource_type == "Encounter":
+        return df.select(
+            col("resource_id"),
+            col("version_id"),
+            col("fhir_last_updated"),
+            col("resource_type"),
+            col("resource.status").alias("status"),
+            col("resource.class.code").alias("encounter_class"),
+            col("resource.type")[0]["coding"][0]["display"].alias("encounter_type"),
+            ref_id(col("resource.subject.reference")).alias("patient_id"),
+            col("resource.period.start").alias("period_start"),
+            col("resource.period.end").alias("period_end"),
+            col("api_url_or_params"),
+            col("extraction_timestamp"),
+            col("resource").alias("resource_raw"),
+        )
+
+    elif resource_type == "Observation":
+        return df.select(
+            col("resource_id"),
+            col("version_id"),
+            col("fhir_last_updated"),
+            col("resource_type"),
+            col("resource.status").alias("status"),
+            col("resource.code.coding")[0]["display"].alias("observation_name"),
+            ref_id(col("resource.subject.reference")).alias("patient_id"),
+            ref_id(col("resource.encounter.reference")).alias("encounter_id"),
+            col("resource.effectiveDateTime").alias("effective_datetime"),
+            col("resource.valueQuantity.value").alias("value"),
+            col("resource.valueQuantity.unit").alias("unit"),
+            col("api_url_or_params"),
+            col("extraction_timestamp"),
+            col("resource").alias("resource_raw"),
+        )
+
+    elif resource_type == "Condition":
+        return df.select(
+            col("resource_id"),
+            col("version_id"),
+            col("fhir_last_updated"),
+            col("resource_type"),
+            col("resource.clinicalStatus.coding")[0]["code"].alias("clinical_status"),
+            col("resource.code.coding")[0]["display"].alias("condition_name"),
+            ref_id(col("resource.subject.reference")).alias("patient_id"),
+            ref_id(col("resource.encounter.reference")).alias("encounter_id"),
+            col("resource.onsetDateTime").alias("onset_datetime"),
+            col("resource.recordedDate").alias("recorded_date"),
+            col("api_url_or_params"),
+            col("extraction_timestamp"),
+            col("resource").alias("resource_raw"),
+        )
+
+    else:
+        raise ValueError(f"No flatten_resource mapping defined for resource_type='{resource_type}'")
+
+
+def run_silver_load(resource_type: str) -> dict:
+    silver_table = f"silver_{resource_type.lower()}"
+    bronze_table = f"bronze_{resource_type.lower()}"
+
+    bronze_df = spark.table(bronze_table)
+
+  
+    window_spec = Window.partitionBy("resource_id").orderBy(col("version_id").desc())
+    latest_df = (
+        bronze_df
+        .withColumn("rn", row_number().over(window_spec))
+        .filter(col("rn") == 1)
+        .drop("rn")
+    )
+
+    incoming_df = flatten_resource(latest_df, resource_type)
+    incoming_count = incoming_df.count()
+    print(f"[{resource_type}] {incoming_count} distinct latest-version resource(s) from Bronze")
+
+    #incremental
+    if not spark.catalog.tableExists(silver_table):
+        seeded_df = (
+            incoming_df
+            .withColumn("IsCurrent", lit(True))
+            .withColumn("EffectiveStartDate", current_timestamp())
+            .withColumn("EffectiveEndDate", lit(FAR_FUTURE_DATE).cast("timestamp"))
+            .withColumn("silver_load_timestamp", current_timestamp())
+        )
+        seeded_df.write.format("delta").mode("overwrite").saveAsTable(silver_table)
+        print(f"[{resource_type}] seeded new Silver table '{silver_table}' with {incoming_count} row(s)")
+        return {"resource_type": resource_type, "mode": "seed", "rows": incoming_count}
+
+    #scd2
+    silver_dt = DeltaTable.forName(spark, silver_table)
+    current_silver_df = spark.table(silver_table).filter(col("IsCurrent") == True)
+
+    changed_or_new_df = (
+        incoming_df.alias("inc")
+        .join(
+            current_silver_df.select("resource_id", "version_id").alias("cur"),
+            on="resource_id",
+            how="left",
+        )
+        .filter(col("cur.version_id").isNull() | (col("inc.version_id") != col("cur.version_id")))
+        .select("inc.*")
+    )
+
+    changed_count = changed_or_new_df.count()
+    print(f"[{resource_type}] {changed_count} new/changed resource(s) to version")
+
+    if changed_count > 0:
+        # 4a — Expire the current row for anything that changed
+        # (rows that are brand new simply won't match and are skipped).
+        (
+            silver_dt.alias("t")
+            .merge(
+                changed_or_new_df.alias("s"),
+                "t.resource_id = s.resource_id AND t.IsCurrent = true",
+            )
+            .whenMatchedUpdate(set={
+                "IsCurrent": lit(False),
+                "EffectiveEndDate": current_timestamp(),
+            })
+            .execute()
+        )
+
+        # 4b — Insert the new current version for every new/changed resource.
+        new_rows_df = (
+            changed_or_new_df
+            .withColumn("IsCurrent", lit(True))
+            .withColumn("EffectiveStartDate", current_timestamp())
+            .withColumn("EffectiveEndDate", lit(FAR_FUTURE_DATE).cast("timestamp"))
+            .withColumn("silver_load_timestamp", current_timestamp())
+        )
+        new_rows_df.write.format("delta").mode("append").saveAsTable(silver_table)
+
+    print(f"[{resource_type}] Silver merge complete — {changed_count} row(s) versioned")
+    return {"resource_type": resource_type, "mode": "merge", "rows_versioned": changed_count}
+
+
+
+#result = run_silver_load(resource_type)
+
+
+for rt in ["Patient", "Encounter", "Observation", "Condition"]:
+     run_silver_load(rt)
+
+notebookutils.notebook.exit(str(result))
