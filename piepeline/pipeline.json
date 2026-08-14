@@ -1,9 +1,13 @@
 {
+    "name": "Data_orches",
+    "objectId": "ee1369cc-8fde-4fd7-be02-9cfbf99a8272",
+    {
   "properties": {
     "activities": [
       {
         "name": "ForEach_Resource",
         "type": "ForEach",
+        "dependsOn": [],
         "typeProperties": {
           "isSequential": true,
           "items": {
@@ -24,8 +28,8 @@
                     "type": "Expression"
                   },
                   "days_back": {
-                    "value": 3,
-                    "type": "int"
+                    "value": "@pipeline().parameters.days_back",
+                    "type": "Expression"
                   }
                 }
               }
@@ -34,7 +38,12 @@
               "name": "Bronze_Load",
               "type": "TridentNotebook",
               "dependsOn": [
-                { "activity": "ingest_fhir_raw", "dependencyConditions": ["Succeeded"] }
+                {
+                  "activity": "ingest_fhir_raw",
+                  "dependencyConditions": [
+                    "Succeeded"
+                  ]
+                }
               ],
               "typeProperties": {
                 "notebookId": "<notebook-id-bronze-load>",
@@ -51,7 +60,12 @@
               "name": "Silver_Load",
               "type": "TridentNotebook",
               "dependsOn": [
-                { "activity": "Bronze_Load", "dependencyConditions": ["Succeeded"] }
+                {
+                  "activity": "Bronze_Load",
+                  "dependencyConditions": [
+                    "Succeeded"
+                  ]
+                }
               ],
               "typeProperties": {
                 "notebookId": "<notebook-id-silver-load>",
@@ -71,7 +85,12 @@
         "name": "Gold_Load",
         "type": "TridentNotebook",
         "dependsOn": [
-          { "activity": "ForEach_Resource", "dependencyConditions": ["Succeeded"] }
+          {
+            "activity": "ForEach_Resource",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
         ],
         "typeProperties": {
           "notebookId": "<notebook-id-gold-load>",
@@ -82,7 +101,13 @@
         "name": "log_pipeline_run",
         "type": "TridentNotebook",
         "dependsOn": [
-          { "activity": "Gold_Load", "dependencyConditions": ["Succeeded", "Failed"] }
+          {
+            "activity": "Gold_Load",
+            "dependencyConditions": [
+              "Succeeded",
+              "Failed"
+            ]
+          }
         ],
         "typeProperties": {
           "notebookId": "<notebook-id-log-pipeline-run>",
@@ -98,9 +123,10 @@
     ],
     "parameters": {
       "days_back": {
-        "type": "int",
+        "type": "Int",
         "defaultValue": 3
       }
     }
   }
 }
+
