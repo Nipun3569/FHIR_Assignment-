@@ -116,3 +116,8 @@ The Gold tables feed a Power BI report through Fabric's default semantic model (
 ## Optional extensions not attempted
 
 XML ingestion — didn't build this out; the API defaults to JSON and adding XML parsing on top wasn't worth the added surface area given the time available. Would follow the same Raw/Bronze pattern, just with an XML parser in Bronze instead of `spark.read.json`.
+
+
+PIPELINE:
+<img width="1091" height="388" alt="image" src="https://github.com/user-attachments/assets/90e7875a-ac62-4eaf-b007-0ccf18e86c6f" />
+
